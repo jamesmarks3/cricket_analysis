@@ -1,0 +1,55 @@
+---
+title: "04-Reflection"
+author: "James Marks"
+date: "2025-12-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Section 4: Reflection
+
+This project investigates how various modelling methods perform when tasked with predicting the outcome of international T20 cricket matches, given match data, weather data, and limited vision of the game trajectory. It was originally designed as a group assignment, but due to external circumstances I completed it independently. Given full time and resources, a greater breadth of models would have been investigated and more emphasis would have been put on feature engineering and hyperparameter tuning. To overcome this, some of the reflection will be more hypothetical than other projects.
+
+## 4.1 Predictive performance
+
+The first example of tailoring our evaluative tests to be cricket specific is the restriction of visible overs. We trimmed our dataframe to simulate a situation where only a fraction of each game had been played, and iteratively trained models on increasing trims to analyse how performance was affected. This reflects real world applications of this type of model; real time match analysis is used in live television coverage and bookmakers will adjust their odds as games progress. Using this also provides excellent insight into how the different models "learn".
+
+As discussed in section 1, we used AUC to evaluate our models. Plotting this against the number of overs the models are exposed to gives us the following curves.
+
+|                                     |                             |
+|-------------------------------------|-----------------------------|
+| ![XGBoost](plots/XGBoost%20AUC.png) | ![MLP](plots/MLP%20AUC.png) |
+| **Figure 1:** XGBoost AUC           | **Figure 2:** MLP AUC       |
+
+We see that when no innings data is given to the models, MLP marginally outperforms XGBoost, still only just better than random guessing. As more information is exposed, XGBoost spikes sharply and trends towards an AUC of almost 1 as the full games are shown. We also see a plateau as either innings comes to an end, and a secondary spike as the second innings begins. Conversely, MLP shows a slower and noisier upwards trend, finishing around 0.8 AUC.
+
+In general, these results are to be expected. Cricket matches often change trajectory very abruptly, and this leads to noisy data. For example, a team that hasn't lost a wicket after 10 overs chasing a below-par score would have a high probability of winning, but losing 4 or 5 wickets in the next two overs would likely swing the prediction in the other direction. See [1] for more information on how rain-affected cricket matches use algorithms to recalculate scores, and the concept of "resources".
+
+This suits decision tree-based models like XGBoost because they split data according to explicit comparisons [2] like `wickets <= 3 AND runs >= 110`. Gradient boosting and regularisation further improve the models by correcting error and reducing overfitting, allowing strong trends to be extracted even from a moderately small data set.
+
+On the other hand, this data does not suit MLPs [3]. While they are known for being able to approximate any function, they are better at smoother relationships. More abrupt changes are difficult to approximate without far larger data sets. Additionally, the categorical data was one-hot encoded which led to a sparse data set, again more difficult to infer from. Overall, a lot of the reasons for the comparatively weaker performance can be attributed to a lack of feature engineering and hyperparameter tuning.
+
+## 4.2 Scaling
+
+As well as analysing predictive power, it is important in data science to consider how a model will perform as data volume and density increase. In the world of cricket data, it is unrealistic to expect to have a training set of 100,000 matches because detailed records only became commonplace in the early 2000s. However, treating each match like a time series opens the door to training models on extremely dense data. Coupled with more intense feature engineering such as run rates, boundary frequency, individual player data and team form, there is opportunity to create a far more detailed data set that, given appropriate tuning, could reduce the performance gap between neural networks like MLP and decision tree models like XGBoost.
+
+As the richness of the data increases, it becomes more and more important to have the appropriate hardware and strategies to train models efficiently. Neural networks like MLP are particularly well suited to GPU acceleration [4]. Deep learning relies on matrices to perform its calculations, and these calculations are able to be carried out in parallel. GPUs are ideal for this because they can devote more transistors to data processing. With large data, neural networks can scale effectively, greatly improving outputs.
+
+XGBoost was designed to scale efficiently on CPU architectures. Since then developments have allowed it to benefit from GPU usage, and many sources say "XGBoost is all you need". However, it would likely not benefit in the same way as MLP from adopting a temporal approach with denser data. Because each split of the tree is independent, allowing parallelisation, XGBoost does not encode order unless it is engineered in. Thus it is unable to explicitly use the time-series style of data.
+
+## 4.3 Conclusions
+
+This project explored how XGBoost and MLP were able to predict the outcome of T20 cricket matches, based on match data and contextual data and with emphasis on realistic constraints. Decision tree-based XGBoost greatly outperformed neural network MLP, especially later on in matches, reflecting the built in error-correction and overfitting reduction. The MLP showed a slower and noisier trajectory, but we theorised that this would improve as data was scaled to be larger and richer, with emphasis on treating each game as a time series. Further work could explore other neural networks such as CNN, and improve the feature engineering and hyperparameter tuning that the neural network lacked.
+
+## References
+
+[1] <https://resources.ecb.co.uk/ecb/document/2025/03/03/b086cf26-f1d4-4ab1-aa68-a7bcfbef32a2/Duckworth-Lewis-Stern-Methodology.pdf>
+
+[2] <https://arxiv.org/pdf/1603.02754>
+
+[3] <https://scikit-learn.org/stable/modules/neural_networks_supervised.html>
+
+[4] <https://gcore.com/blog/deep-learning-gpu>

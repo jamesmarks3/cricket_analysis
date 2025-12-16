@@ -1,2 +1,8 @@
 # cricket_analysis
-Using match data and meta data to predict the results of International T20 matches since 2010
+## Project Group
+James Marks
+## Reading Order
+01-Introduction.Rmd
+02-Data_Preprocessing.Rmd
+03-Modelling.Rmd
+04-Reflection.Rmd

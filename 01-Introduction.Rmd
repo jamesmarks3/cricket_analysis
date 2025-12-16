@@ -1,0 +1,80 @@
+---
+title: "01-Introduction"
+author: "James Marks"
+date: "2025-12-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Section 1: Introduction
+
+Sports data analysis is a common problem in data science, and often involves machine learning and neural networks. Every sport comes with its own unique data, and analysis of this data can be used to inform coaches, influence gambling odds and allow pundits to give insightful commentary. We will be focusing on cricket data because it is very interesting in the way it combines categorical and numerical data, and is particularly sensitive to factors like weather and venue.
+
+There are three main ways that cricket is played: test, 50-over and 20-over. Test matches span five days with each team batting up to two times, and 50 and 20-over matches feature one limited-over innings as expected. There exists an R library, `cricketdata` [1], that functions as an API for the websites cricinfo and cricsheet. In general, cricket data is difficult to acquire in bulk so this resource is crucial to our investigation.
+
+The inspiration for this project is CricViz's win predictor, WinViz. This is unfortunately proprietary software so little is known about how it combines every major T20 result, as well as relative strengths of teams at various grounds. It is a sophisticated algorithm used by broadcasters globally in their coverage of international cricket.
+
+Of the data that `cricketdata` gives us, the largest set is that of mens international T20 matches. Not only is T20 data the most abundant, it is also the most information dense. It is the shortest format of cricket, and so each ball carries more value; the trajectory of a game can change dramatically inside an over. There is an argument to combine mens and womens T20 data into a larger dataset, however the two would likely contain different patterns like par scores and dominant sides, so we would only be reducing predictive power.
+
+Cricket is also greatly affected by the weather. Rainfall, temperature, humidity and sunlight can all influence player performance and match outcome. This insight leads us to our research question:
+
+*Can we use neural networks to predict the outcome of IT20 cricket matches, with match, ball-by-ball and weather data?*
+
+We will also be investigating how predictive performance improves as more ball-by-ball data becomes available, simulating real-time information, comparing multiple predictive models, and discussing the performance and scalability of these models.
+
+### Evaluation metrics
+
+There are lots of evaluation metrics used in machine learning, in particular accuracy, precision, recall and AUC [2]. These are usually selected on a case-specific basis because they are appropriate for different models.
+
+-   Accuracy is "the proportion of correct predictions made by the model out of all predictions". This is excellent for quickly determining the strength of the model, but can fall short when data is imbalanced and risks misclassifying smaller classes.
+
+-   Precision is a measure of "how many of the positive predictions made by the model are actually correct". It is often used in cases where false positives are particularly costly, e.g. medical diagnoses.
+
+-   Recall is a measure of "how many of the actual positive cases were correctly identified". Somewhat opposite to precision, it is used when false negatives are more costly.
+
+-   AUC, or area under the curve, compares the rate of true positives and false positives. It "represents a trade-off between the sensitivity and specificity of a classifier" and is effective when "false positives and false negatives are of similar importance" in a balanced data set.
+
+In our data set, we have `team_1` and `team_2` for each match. This generally has `team_1` being the home team, but not always, for example tournaments where teams play in a third country. We choose the factor `team_1_win` to be our predicting factor. This could introduce a bias for home teams, but in our EDA we determined that home advantage is far less prevalent in T20s when compared to longer format games. As such, we have created a symmetry which means false positives and false negatives are essentially equivalent. Considering this and the fact that `team_1_win` is true for 48.5% of games, we choose to use AUC to be our evaluation metric.
+
+## Modelling Strategy
+
+We will be comparing two models, XGBoost [3] and MLP [4]. The scope of this investigation is determined mainly by a lack of time and the fact that this is a solo project. Ideally we would look at other neural networks, e.g. CNN, and compare to other methods like logistic regression.
+
+XGBoost (eXtreme Gradient Boosting) uses gradient boosted decision trees, making use of gradient descent in supervised learning, and it is "well known for its speed, efficiency and ability to scale well with large datasets".
+
+MLP (Multi Layer Perceptron) is a type of neural network that has multiple layers of neurons. They are able to learn nonlinear relationships, which lends them to classification and pattern recognition tasks.
+
+## Project Structure
+
+### 02-Data Preprocessing
+
+Using `cricketdata`, `openmeteo` and `tidygeocoder` to fetch and build a clean dataframe that contains:
+
+-   Which teams are playing, the date, the toss outcome and which team wins
+
+-   The city, venue, latitude and longitude
+
+-   The mean temperature, humidity, cloud cover, and total rainfall
+
+-   Cumulative runs and wickets at two over intervals
+
+### 03-Modelling
+
+Implementing `xgboost` and `neuralnet` , and investigating how predicting power improves when more of the match is known.
+
+### 04-Performance and Scaling
+
+Discussing how each model would perform as data grows, in terms of predictive power and computational cost.
+
+## References
+
+[1] <https://cran.r-project.org/web/packages/cricketdata/vignettes/cricketdata_R_pkg.html>
+
+[2] <https://www.geeksforgeeks.org/machine-learning/metrics-for-machine-learning-model/>
+
+[3] <https://www.ibm.com/think/topics/xgboost>
+
+[4] <https://www.datacamp.com/tutorial/multilayer-perceptrons-in-machine-learning>

@@ -1,0 +1,140 @@
+---
+title: "decision trees"
+output: html_document
+date: "2025-10-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# R Markdown
+
+
+
+## Libraries
+```{r, message=FALSE, warning=FALSE, results='hide'}
+tidy_lib <- function(lib) {
+  if (!require(lib, character.only = TRUE)) {
+    install.packages(lib)
+  }
+  library(lib, character.only = TRUE)
+}
+tidy_lib("tidyr")
+tidy_lib("dplyr")
+tidy_lib("lubridate") 
+tidy_lib("readr")
+tidy_lib("purrr")
+tidy_lib("ggplot2")
+tidy_lib("rpart")
+tidy_lib("rpart.plot")
+```
+
+## Read ball by ball data csv
+```{r}
+odis_bbb_recent <- read.csv("../data/processed/odi_bbb_recent.csv")
+```
+
+## Clean the data
+```{r}
+odis_bbb_recent <- odis_bbb_recent %>%
+  select(match_id, innings, ball, bowling_style, batting_style, runs_off_bat, extras, wicket_type, batting_team, bowling_team, winner) %>%
+  separate(ball, into = c("over", "ball_"), sep = "\\.", convert = TRUE) %>%
+  mutate(
+    legal_ball = ifelse(extras > 0, 0, 1),
+    wicket = ifelse(wicket_type == "", 0, 1),
+    result = ifelse(batting_team == winner, "Won", "Lost")
+    )
+```
+
+```{r}
+odi_balls_10 <- odis_bbb_recent %>%
+  filter(over < 10)
+```
+
+```{r}
+odi_balls_10 <- odi_balls_10 %>%
+  group_by(match_id, innings) %>%
+  arrange(over, ball_) %>%
+  mutate(
+    cum_runs = cumsum(runs_off_bat + extras),
+    cum_wkts = cumsum(wicket),
+    cum_legal_balls = cumsum(legal_ball),
+    run_rate_sofar = cum_runs / cum_legal_balls / 6
+    ) %>%
+  ungroup()
+```
+
+```{r}
+set.seed(123)
+unique_matches <- unique(odi_balls_10$match_id)
+test_matches <- sample(unique_matches, 0.2 * length(unique_matches))
+
+train <- odi_balls_10 %>% filter(!match_id %in% test_matches)
+test  <- odi_balls_10 %>% filter(match_id %in% test_matches)
+```
+
+```{r}
+tree_model <- rpart(
+  result ~ cum_runs + cum_wkts + run_rate_sofar + over + ball_ + bowling_team + batting_team,
+  data = train,
+  method = "class",
+  control = rpart.control(cp = 0.005, minsplit = 30)
+)
+
+rpart.plot(tree_model, type = 2, extra = 104)
+```
+
+```{r}
+cps = c(0.0001, 0.001, 0.005) ## Add as a separate section, talk about how decision tree is prone to overfitting
+
+for (cp_ in cps) {
+tree_model <- rpart(
+  result ~ cum_runs + cum_wkts + run_rate_sofar + over + ball_,
+  data = train,
+  method = "class",
+  control = rpart.control(cp = cp_, minsplit = 30, maxdepth = 5)
+)
+
+rpart.plot(tree_model, type = 2, extra = 104)
+}
+```
+### added weights
+```{r}
+train <- train %>%
+  group_by(match_id, innings) %>%
+  mutate(weight = cum_legal_balls / max(cum_legal_balls)) %>%
+  ungroup()
+
+tree_weighted <- rpart(
+  result ~ cum_runs + cum_wkts + run_rate_sofar + over + ball_,
+  data = train,
+  weights = train$weight,
+  method = "class",
+  control = rpart.control(
+    cp = 0.0001,
+    maxdepth = 5
+  )
+)
+
+rpart.plot(tree_weighted, type = 2, extra = 104)
+```
+
+```{r}
+odi_10_summary <- odis_bbb_recent %>%
+  filter(over < 10) %>%
+  group_by(match_id, innings, batting_team, bowling_team, result, over) %>%
+  summarise(
+    runs_in_over = sum(runs_off_bat + extras, na.rm = TRUE),
+    wkts_in_over = sum(wicket, na.rm = TRUE),
+    .groups = "drop_last"
+  ) %>%
+  pivot_wider(
+    names_from = over,
+    values_from = c(runs_in_over, wkts_in_over),
+    names_prefix = "",
+    names_glue = "{.value}_over_{over + 1}"
+  ) %>%
+  summarise(across(everything(), ~ first(.x))) %>%
+  ungroup()
+```

@@ -1,0 +1,334 @@
+---
+title: "03-Modelling"
+author: "James Marks"
+date: "2025-11-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Section 3: Modelling
+
+```{r libraries, include=FALSE}
+tidy_lib <- function(lib) {
+  if (!require(lib, character.only = TRUE)) {
+    install.packages(lib)
+  }
+  library(lib, character.only = TRUE)
+}
+
+libs <- c("tidyr", 
+          "dplyr",
+          "stringr",
+          "lubridate", 
+          "readr", 
+          "purrr", 
+          "fs", 
+          "xgboost",
+          "pROC",
+          "ggplot2",
+          "Matrix",
+          "data.table",
+          "neuralnet",
+          "recipes")
+
+for (lib in libs) {
+  tidy_lib(lib)
+}
+
+set.seed(123)
+```
+
+### 3.1 Get T20s summary data
+
+In the previous section we saved our clean processed data, we now retrieve it from the .csv file.
+
+```{r read}
+summaries_path <- path("data", "processed", "t20s_processed.csv")
+t20s_summaries <- read.csv(summaries_path)
+```
+
+### 3.2 Clean up incomplete games and deal with missing data
+
+Because cricket is so affected by weather, there are games that are abandoned due to rain, light, and occasionally other factors like locusts! These games have an `NA` value in the `winner` category, so we can simply filter them out.
+
+There is also a small amount of missing weather data, as well as `NA` values for the overs that were not reached in each game. For example, if the team batting second were bowled out in 15 overs, we would not have data for the 16th, 18th or 20th over of that innings. We choose to take medians for weather data, and use innings totals for all missing runs / wickets data. If the missing weather data were larger, we would have to be more thorough when considering the bias this introduces with regards to data leaking, but for this size data it is not consequential.
+
+```{r}
+t20s_summaries <- t20s_summaries %>%
+  filter(!is.na(winner)) %>% 
+  mutate(start_date = as.numeric(as.Date(start_date)),
+         city = coalesce(city, word(venue, 1)),
+         across(starts_with("daily_"), 
+                ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)),
+         across(matches("^innings_1_over_[0-9]+_score$"),
+                ~ ifelse(is.na(.x), coalesce(.x, innings_1_total), .x)),
+         across(matches("^innings_2_over_[0-9]+_score$"),
+                ~ ifelse(is.na(.x), coalesce(.x, innings_1_total), .x))) %>% 
+  rowwise() %>%
+  mutate(across(matches("^innings_1_over_[0-9]+_wickets$"), 
+                ~ ifelse(is.na(.x), 
+                         max(c_across(matches("^innings_1_over_[0-9]+_wickets$")), na.rm = TRUE), 
+                         .x)),
+         across(matches("^innings_2_over_[0-9]+_wickets$"), 
+                ~ ifelse(is.na(.x), 
+                         max(0, c_across(matches("^innings_2_over_[0-9]+_wickets$")), na.rm = TRUE), 
+                         .x))) %>%
+  ungroup() %>% 
+  filter(!is.na(innings_2_total)) %>% 
+  select(- innings_1_total, - innings_2_total, - daily_sunset) # sunset causes more hassle than it's worth
+```
+
+### 3.3 Group into train and test data
+
+Here we choose to split our data into:
+
+-   `train`: Games before 2024, and
+
+-   `test`: Games during or after 2025.
+
+```{r test and train}
+t20s_summaries <- t20s_summaries %>%
+  mutate(team_1_win = ifelse(team1 == winner, 1, 0),
+    train_test = case_when(
+    start_date >= as.Date("2024-01-01") ~ "test",
+    TRUE ~ "train"
+  ))
+```
+
+### 3.4 Trimming data
+
+Our question revolves around predicting match outcomes based on match data and weather data, so we need to trim our train and test data to only include match data up to a predetermined number of overs. We use regex [1] to do this effectively.
+
+```{r}
+trim_overs <- function(df, num_overs = 30) {
+  in1_limit <- min(num_overs, 20)
+  in2_limit <- max(num_overs - 20, 0)
+  
+  cols <- names(df)
+  is_over <- grepl("innings_\\d_over_\\d+_", cols)
+
+  inning <- ifelse(
+    is_over,
+    as.numeric(sub("innings_(\\d)_.*", "\\1", cols)),
+    NA
+  )
+
+  over <- ifelse(
+    is_over,
+    as.numeric(sub(".*_over_(\\d+)_.*", "\\1", cols)),
+    NA
+  )
+
+  keep <- cols[is.na(inning) | (inning == 1 & over <= in1_limit) | (inning == 2 & over <= in2_limit)]
+
+  df[, keep, drop = FALSE]
+}
+```
+
+### 3.5 XGBoost
+
+XGBoost [2] is a decision tree based model that performs well with data that has non-linear interactions and multiple feature types. As such we expect it to perform well on our data. It is in general simple to implement; it does not require scaling and is able to handle missing and non-numerical data without issues. These are contributing factors to its use worldwide in data science.
+
+In earlier EDA, we found that using a `max_depth` greater than 5 led to overfitting. It would be interesting to do similar tests with regards to `eta`, the "learning rate".
+
+```{r}
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.05,
+  max_depth = 5
+)
+
+xgboost_df <- function(df) {
+  df <- df %>% 
+    mutate(across(where(is.character), as.factor)) %>% 
+    drop_na() # redundant after na cleaning earlier
+  
+  mm <- model.matrix(team_1_win ~ . - match_id - train_test - winner - 1, data = df)
+  
+  X_train <- mm[df$train_test == "train", , drop = FALSE]
+  X_test  <- mm[df$train_test == "test",  , drop = FALSE]
+  
+  y_train <- df$team_1_win[df$train_test == "train"]
+  y_test  <- df$team_1_win[df$train_test == "test"]
+  
+  dtrain <- xgb.DMatrix(X_train, label = y_train)
+  dtest  <- xgb.DMatrix(X_test,  label = y_test)
+  
+  xgb_model <- xgb.train(
+    params,
+    data = dtrain,
+    nrounds = 500,
+    watchlist = list(train = dtrain, test = dtest),
+    early_stopping_rounds = 20,
+    verbose = 0
+  )
+  
+  return(list(
+    model     = xgb_model,
+    dtest     = dtest,
+    y_test    = y_test
+  ))
+}
+```
+
+To investigate our data further, we use XGBoost to plot the factors that are most influential in our prediction of a match after the first 10 overs of the second innings. To order them we use a characteristic called gain [3], which measures the improvement in performance when a feature is used to split a node in a decision tree.
+
+```{r}
+xgb_result_30 <- xgboost_df(trim_overs(t20s_summaries, 30))
+
+xgb_importance_30 <- xgb.importance(
+  model = xgb_result_30$model,
+  feature_names = xgb_result_30$feature_names
+)
+
+xgb_importance_30 %>%
+  slice_max(Gain, n = 20) %>% # show top 20
+  ggplot(aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top Predictive Features (30 overs)",
+    x = "Feature",
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+```
+
+Lastly, to investigate how the model improves when it is given access to more of the game, we plot the AUC of the model for each number of overs exposed to, starting at zero and ending at the full match. As expected, zero overs gives an AUC that is low but still greater than 0.5, indicating that metadata does influence the result, and 40 overs gives a near perfect prediction as the entire game is there to be analysed.
+
+```{r}
+xgb_train_model_and_get_auc <- function(num_overs) {
+  df_trim <- trim_overs(t20s_summaries, num_overs)
+  result <- xgboost_df(df_trim)
+
+  preds <- predict(result$model, result$dtest)
+  auc_val <- pROC::auc(result$y_test, preds)
+
+  return(auc_val)
+}
+
+overs_vec <- seq(0, 40, 2)
+xgb_auc_results <- sapply(overs_vec, xgb_train_model_and_get_auc)
+
+data.frame(overs = overs_vec, auc = xgb_auc_results)
+
+ggplot(data.frame(overs = overs_vec, auc = xgb_auc_results),
+       aes(x = overs, y = auc)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Predictive Power vs Number of Known Overs",
+    x = "Overs Included",
+    y = "AUC"
+  )
+```
+
+### 3.6 MLP
+
+Lastly, we implement the MLP, using `neuralnet`. This was more difficult to do than XGBoost because it requires more rigorous data cleaning before it can be used. We used the `scale()` function on the numerical factors and one-hot encoding on the categorical factors, before merging the two back together and training the model. Here we are at risk of introducing bias into the system because we scale our data before splitting into train and test frames. However this would only be a problem if we were investigating trends over time, which we are not.
+
+The most important hyperparameter of this model is the number of neurons and layers of neurons it has. After some experimentation we found that using `hidden = c(64, 32)` was appropriate for the laptop the code was being run on.
+
+```{r}
+mlp_df <- function(df) {
+  t20s_mlp_clean <- df %>% 
+    select(-winner)
+
+  idx_train <- t20s_mlp_clean$train_test == "train"
+  idx_test  <- t20s_mlp_clean$train_test == "test"
+
+  y <- t20s_mlp_clean$team_1_win
+
+  t20s_mlp_numeric <- t20s_mlp_clean %>%
+    select(where(is.numeric)) %>% 
+    select(-match_id, -team_1_win) %>% 
+    scale() %>% 
+    as.data.frame()
+
+  t20s_mlp_categorical <- t20s_mlp_clean %>% 
+    select(where(is.character))
+
+  categorical_matrix <- model.matrix(~ . -1, data = t20s_mlp_categorical) %>% 
+    as.data.frame()
+
+  colnames(categorical_matrix) <- make.names(colnames(categorical_matrix))
+  categorical_matrix <- categorical_matrix[, !duplicated(colnames(categorical_matrix))]
+
+  X <- cbind(t20s_mlp_numeric, categorical_matrix)
+
+  mlp_data <- cbind(X, team_1_win = y)
+
+  dtrain <- mlp_data[idx_train, ]
+  dtest  <- mlp_data[idx_test, ]
+
+  model <- neuralnet(
+    team_1_win ~ .,
+    data = dtrain,
+    hidden = c(64, 32),
+    linear.output = FALSE
+  )
+
+  return(list(
+    model  = model,
+    dtrain = dtrain,
+    dtest  = dtest
+  ))
+}
+```
+
+Again we plot AUC against known overs to get a picture of how the mode performs as more information is exposed.
+
+```{r}
+mlp_train_model_and_get_auc <- function(num_overs) {
+
+  df_trim <- trim_overs(t20s_summaries, num_overs)
+  result <- mlp_df(df_trim)
+
+  input_cols <- setdiff(colnames(result$dtest), "team_1_win")
+
+  preds <- compute(
+    result$model,
+    result$dtest[, input_cols]
+  )$net.result
+
+  auc_val <- pROC::auc(
+    result$dtest$team_1_win,
+    as.vector(preds)
+  )
+
+  return(as.numeric(auc_val))
+}
+
+overs_vec <- seq(0, 40, 2)
+mlp_auc_results <- sapply(overs_vec, mlp_train_model_and_get_auc)
+
+auc_df <- data.frame(
+  overs = overs_vec,
+  auc = mlp_auc_results
+)
+
+ggplot(auc_df, aes(x = overs, y = auc)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Predictive Power vs Number of Known Overs",
+    x = "Overs Included",
+    y = "AUC"
+  )
+```
+
+When we compare these two plots, a few things are clear. Both show an increase in predictive power when exposed to more overs, but XGBoost increases far more dramatically and far more in keeping with what one might expect. When the models are given no information about the game situation, only given metadata and weather data, MLP performs slightly better. However, as soon as the models are exposed to the first powerplay XGBoost begins to outperform MLP easily. This gap widens steadily as additional overs are included, with XGBoost approaching near-perfect predictions by the end of the innings, while the MLP exhibits a slower, noisier improvement and plateaus substantially earlier. This behaviour is consistent with the strengths of XGBoost. It can efficiently analyse temporal variables like runs, wickets, and run rate that strongly determine match outcome, whereas the neural network struggles to see these conditional relationships without explicit temporal structure. Overall, these results suggest that while neural networks can extract some signal from static features, tree-based methods are significantly better suited to modelling the evolving match state in this representation. It would be an interesting next step to implement a convolutional neural network (CNN) that models the temporal structure of a cricket match, treating the sequence of overs as a time series rather than a collection of independent cumulative features. It is possible that this more deliberate training could produce a model to rival XGBoost, especially at scale.
+
+## References
+
+[1] <https://www.rexegg.com/regex-quickstart.php>
+
+[2] <https://xgboost.readthedocs.io/en/stable/>
+
+[3] <https://xgboost.readthedocs.io/en/latest/tutorials/model.html>

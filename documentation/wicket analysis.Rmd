@@ -1,0 +1,45 @@
+---
+title: "Wickets in over"
+output: html_document
+date: "2025-10-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# R Markdown
+
+## Libraries
+```{r, message=FALSE, warning=FALSE, results='hide'}
+tidy_lib <- function(lib) {
+  if (!require(lib, character.only = TRUE)) {
+    install.packages(lib)
+  }
+  library(lib, character.only = TRUE)
+}
+tidy_lib("tidyr")
+tidy_lib("dplyr")
+tidy_lib("lubridate") 
+tidy_lib("readr")
+tidy_lib("purrr")
+tidy_lib("ggplot2")
+```
+
+## Read ball by ball data csv
+```{r}
+odis_bbb_recent <- read.csv("../data/processed/odi_bbb_recent.csv")
+```
+
+## Filter dataframe for wickets only
+```{r}
+wicket_data <- odis_bbb_recent %>%
+  filter(wicket_type != "") %>%
+  separate(ball, into = c("over", "ball_"), sep = "\\.", convert = TRUE)
+```
+
+## Plot frequencies
+```{r}
+ggplot(wicket_data, aes(x = ball_)) +
+          geom_bar()
+```

@@ -1,0 +1,219 @@
+---
+title: "02-Data Preproccessing"
+author: "James Marks"
+date: "2025-11-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Section 2: Data Preprocessing
+
+```{r libraries, include=FALSE}
+tidy_lib <- function(lib) {
+  if (!require(lib, character.only = TRUE)) {
+    install.packages(lib)
+  }
+  library(lib, character.only = TRUE)
+}
+
+libs <- c("tidyr", 
+          "dplyr", 
+          "lubridate", 
+          "cricketdata", 
+          "openmeteo", 
+          "tidygeocoder", 
+          "readr", 
+          "purrr", 
+          "fs")
+
+for (lib in libs) {
+  tidy_lib(lib)
+}
+```
+
+### 2.1 Fetch raw data from `cricketdata` and write to .CSV if not already loaded
+
+Our first step is to collect the raw data from `cricketdata`. This comes in two forms: ball by ball, containing the runs, wickets, and players involved in every ball of every match, and match data, which contains the date, venue, result, etc. of each game. Since these data sets are large (`t20s_bbb` has 686723 rows and `t20s_match` has 3044 rows), we only fetch them if necessary, otherwise reading from a pre-existing .csv.
+
+```{r fetch and write}
+always_load = FALSE
+
+match_path <- path("data", "unprocessed", "t20s_match_unprocessed.csv")
+bbb_path <- path("data", "unprocessed", "t20s_bbb_unprocessed.csv")
+
+if (!file_exists(match_path) || always_load) {
+  t20s_match <- fetch_cricsheet(type = "match", gender = "male", competition = "t20s")
+  write.csv(t20s_match, file = match_path, row.names = FALSE)
+} else {
+  t20s_match <- read.csv(match_path)
+}
+if (!file_exists(bbb_path) || always_load) {
+  t20s_bbb <- fetch_cricsheet(type = "bbb", gender = "male", competition = "t20s")
+  write.csv(t20s_bbb, file = bbb_path, row.names = FALSE)
+} else {
+  t20s_bbb <- read.csv(bbb_path)
+}
+```
+
+### 2.2 Tidy up data, select relevant headings
+
+The data is currently messy and needs cleaning. We elect not to combine the match and ball by ball data until we have the weather data but can still select the relevant headings. In our investigation we are not interested in individual players, and this is what takes up a lot of the ball by ball columns.
+
+```{r clean}
+t20s_match <- t20s_match %>%
+  mutate(match_id = as.character(match_id),
+         start_date = as.Date(date)) %>% 
+  select(match_id, team1, team2, start_date, venue, city, toss_winner, toss_decision, winner)
+
+t20s_bbb <- t20s_bbb %>% 
+  mutate(match_id = as.character(match_id), 
+         start_date = as.Date(start_date)) %>%
+  select(match_id, innings, over, ball, batting_team, bowling_team, runs_scored_yet, wickets_lost_yet, innings1_total, innings2_total)
+```
+
+### 2.3 Get longitude and latitude data for each stadium
+
+In order to fetch weather data from `openmeteo`, we need the longitude and latitude of each stadium. This is not built into the dataframe so we use `tidygeocoder` [1], a package that takes an address and returns its global coordinates. The package automatically handles duplicate queries, but still takes roughly 1 second per address.
+
+Some of the venues do not return an address at first. To combat this we run a second pass that only includes the ground's city. This is less accurate but still acceptable.
+
+```{r location}
+locations <- t20s_match %>%
+  select(match_id, venue, city) %>%
+  mutate(loc = paste(venue, city, sep = ", "),
+         city = if_else(is.na(city), venue, city))
+
+pass1 <- locations %>%
+  geocode(address = loc, method = "osm")
+
+pass2 <- pass1 %>%
+  filter(is.na(long) | is.na(lat)) %>%
+  select(match_id, venue, city) %>%
+  geocode(address = city, method = "osm")
+
+locations_final <- pass1 %>%
+  filter(!match_id %in% pass2$match_id) %>%
+  bind_rows(pass2) %>%
+  arrange(match_id) %>%
+  mutate(match_id = as.character(match_id))
+
+t20s_match <- t20s_match %>%
+  left_join(locations_final) %>%
+  select(-loc)
+```
+
+### 2.4 Get historic weather data based on location and date
+
+Now that we have global coordinates for each of our grounds, we can fetch the historical weather data. The package `openmeteo` has a function that gives hourly data, which could be used to interpolate ball by ball weather, but it was decided that that falls outside the scope of this investigation.
+
+The api that `openmeteo` uses has a limit of 600 calls per minute. To circumvent this, we use batches and sleep for 60 seconds between each one. At industrial scale this is of course something that could be avoided by paying for an api subscription.
+
+The weather data we choose to retrieve is: the mean temperature at 2m above the ground, the mean relative humidity at 2m above the ground, the total precipitation, mean cloud cover and time of sunset.
+
+```{r weather}
+weather_params <- c("temperature_2m_mean", 
+                    "relative_humidity_2m_mean", 
+                    "rain_sum",
+                    "cloud_cover_mean",
+                    "sunset")
+
+batch_size <- 600
+n_batches <- ceiling(nrow(t20s_match) / batch_size)
+
+results <- list()
+
+for(i in seq_len(n_batches)) {
+  start_row <- (i - 1) * batch_size + 1
+  end_row   <- min(i * batch_size, nrow(t20s_match))
+  
+  batch <- t20s_match[start_row:end_row, ]
+  
+  batch_results <- batch %>%
+    filter(!is.na(lat) & !is.na(long)) %>%
+    rowwise() %>%
+    mutate(
+    weather_data = list(
+      weather_history(
+        location = c(lat, long),
+        start = format(as.Date(start_date), "%Y-%m-%d"),
+        end   = format(as.Date(start_date), "%Y-%m-%d"),
+        daily = weather_params
+      )
+    )
+  ) %>%
+    ungroup()
+  
+  results[[i]] <- batch_results
+  
+  if(i < n_batches) Sys.sleep(60)  # wait 1 minute before next batch because of api cooldown
+}
+
+all_weather <- bind_rows(results) %>%
+  unnest_wider(weather_data)
+```
+
+### 2.5 Merge data into unified dataframe
+
+Before we can merge ball by ball and match data, we must choose what we want to take from `t20s_bbb`. So that we can effectively investigate predictive power vs known overs later on, we aggregate the scores and wickets for every two overs.
+
+Finally we are able to combine our dataframes using `match_id`, and then select exactly which columns we would like to save. Finally we create our predictor column, `team_1_win`.
+
+```{r aggregate and merge}
+t20s_powerplays <- t20s_bbb %>%
+  filter(over %in% seq(2, 20, by = 2)) %>%
+  group_by(match_id, innings, over) %>%
+  summarise(score = max(runs_scored_yet, na.rm = TRUE), 
+            wickets = max(wickets_lost_yet, na.rm = TRUE),
+            .groups = "drop") %>%
+
+  pivot_wider(
+    names_from  = c(innings, over),
+    values_from = c(score, wickets),
+    names_glue  = "innings_{innings}_over_{over}_{.value}"
+  )
+
+t20s_final_scores <- t20s_bbb %>% 
+  select(match_id, innings1_total, innings2_total) %>% 
+  group_by(match_id) %>% 
+  distinct()
+  
+t20s_summaries <- t20s_match %>%
+  left_join(all_weather, by = "match_id") %>% 
+  left_join(t20s_final_scores, by = "match_id") %>% 
+  left_join(t20s_powerplays, by = "match_id") %>%
+  
+  mutate(sunset_hour = lubridate::hour(daily_sunset) + lubridate::minute(daily_sunset)/60) %>%
+  
+  select(
+    match_id,
+    team1 = team1.x,
+    team2 = team2.x,
+    start_date = start_date.x,
+    venue = venue.x,
+    city = city.x,
+    toss_winner = toss_winner.x,
+    toss_decision = toss_decision.x,
+    winner = winner.x,
+    innings_1_total = innings1_total,
+    innings_2_total = innings2_total,
+    starts_with("daily_"),
+    starts_with("innings_"),
+  ) %>%
+  mutate(team_1_win = ifelse(team1 == winner, TRUE, FALSE))
+```
+
+### 2.6 Write to processed data file
+
+Now that our data is clean, we write it to a .csv file and save it in the processed data file.
+
+```{r write}
+summaries_path <- path("data", "processed", "t20s_processed.csv")
+write.csv(t20s_summaries, file = summaries_path, row.names = FALSE)
+```
+
+## References
+
+[1] <https://cran.r-project.org/web/packages/tidygeocoder/refman/tidygeocoder.html>
